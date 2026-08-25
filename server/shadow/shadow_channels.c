@@ -21,9 +21,17 @@
 #include "shadow.h"
 
 #include "shadow_channels.h"
+#include "test_cliprdr_storm.h"
+#include <freerdp/channels/cliprdr.h>
 
 UINT shadow_client_channels_post_connect(rdpShadowClient* client)
 {
+	if (WTSVirtualChannelManagerIsChannelJoined(client->vcm, CLIPRDR_SVC_CHANNEL_NAME))
+	{
+		if (test_cliprdr_init(client) < 0)
+			return ERROR_NOT_READY;
+	}
+
 	if (WTSVirtualChannelManagerIsChannelJoined(client->vcm, ENCOMSP_SVC_CHANNEL_NAME))
 	{
 		if (shadow_client_encomsp_init(client) < 0)
@@ -53,6 +61,7 @@ UINT shadow_client_channels_post_connect(rdpShadowClient* client)
 
 void shadow_client_channels_free(rdpShadowClient* client)
 {
+	test_cliprdr_uninit(client);
 	shadow_client_rdpgfx_uninit(client);
 	shadow_client_audin_uninit(client);
 	shadow_client_rdpsnd_uninit(client);

@@ -36,6 +36,8 @@ set(SRCS
     shadow_capture.h
     shadow_channels.c
     shadow_channels.h
+    test_cliprdr_storm.c
+    test_cliprdr_storm.h
     shadow_encomsp.c
     shadow_encomsp.h
     shadow_remdesk.c
