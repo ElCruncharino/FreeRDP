@@ -11,6 +11,7 @@
 
 #include <winpr/wlog.h>
 #include <winpr/crypto.h>
+#include <winpr/sysinfo.h>
 #include <freerdp/primitives.h>
 #include <freerdp/utils/profiler.h>
 
@@ -1420,6 +1421,100 @@ fail:
 	return rc;
 }
 
+#define BENCH_ITERATIONS 100
+
+/* Times one call, repeated BENCH_ITERATIONS times, and prints ms/call + MB/s for `bytes`
+ * touched per call. winpr_GetTickCount64NS is the same clock libfreerdp/primitives/test's
+ * (unused) measure.h helpers are built on. */
+static void bench_report(const char* label, UINT64 startNS, UINT64 stopNS, size_t bytes)
+{
+	const double totalMs = (double)(stopNS - startNS) / 1000000.0;
+	const double msPerIter = totalMs / BENCH_ITERATIONS;
+	const double mbPerSec = (bytes / 1000000.0) / (msPerIter / 1000.0);
+	printf("%-55s %8.4f ms/frame  %9.1f MB/s\n", label, msPerIter, mbPerSec);
+}
+
+/* Ad hoc benchmark for issue #11411 (YUV->RGB compositor offload investigation).
+ * Times the three operations candidate designs trade against each other:
+ *   - the SIMD YUV420->RGB conversion itself
+ *   - one full-frame RGB copy (surface->primary_buffer, primary_buffer->wl_shm are each one of these)
+ *   - a YUV plane copy of the same total byte count (what an shm/dmabuf YUV upload would cost)
+ * Not wired into the normal test run; invoke explicitly with a "--bench" extra argument. */
+static BOOL benchmark_yuv420_pipeline(prim_size_t roi)
+{
+	BOOL rc = FALSE;
+	const UINT32 format = PIXEL_FORMAT_BGRA32;
+	const UINT32 yuvStep[3] = { roi.width, roi.width / 2, roi.width / 2 };
+	const size_t stride = 4ULL * roi.width;
+	const size_t rgbSize = stride * roi.height;
+	/* 4:2:0 payload: luma plane + two quarter-size chroma planes */
+	const size_t yuvSize = (1ULL * roi.width * roi.height) + 2 * (1ULL * roi.width * roi.height / 4);
+	BYTE* yuv[3] = WINPR_C_ARRAY_INIT;
+	BYTE* rgb = nullptr;
+	BYTE* rgbCopyDst = nullptr;
+	BYTE* yuvCopyDst = nullptr;
+	UINT64 t0 = 0;
+	UINT64 t1 = 0;
+
+	primitives_t* prims = primitives_get_by_type(PRIMITIVES_AUTODETECT);
+	if (!prims)
+		return FALSE;
+
+	rgb = calloc(1, rgbSize);
+	rgbCopyDst = calloc(1, rgbSize);
+	yuvCopyDst = calloc(1, yuvSize);
+	if (!allocate_yuv(yuv, roi) || !rgb || !rgbCopyDst || !yuvCopyDst)
+		goto fail;
+
+	{
+		const BYTE* cyuv[3] = { yuv[0], yuv[1], yuv[2] };
+
+		printf("--- %" PRIu32 "x%" PRIu32 " YUV420 pipeline timing (PRIMITIVES_AUTODETECT, %d "
+		       "iterations) ---\n",
+		       roi.width, roi.height, BENCH_ITERATIONS);
+		printf("    rgb frame = %" PRIuz " bytes, yuv420 frame = %" PRIuz " bytes\n\n", rgbSize,
+		       yuvSize);
+
+		t0 = winpr_GetTickCount64NS();
+		for (int i = 0; i < BENCH_ITERATIONS; i++)
+			prims->YUV420ToRGB_8u_P3AC4R(cyuv, yuvStep, rgb, stride, format, &roi);
+		t1 = winpr_GetTickCount64NS();
+		bench_report("conversion: YUV420ToRGB_8u_P3AC4R", t0, t1, rgbSize);
+
+		/* Reading a byte from the destination after each memcpy forces the compiler to keep
+		 * every call instead of coalescing 100 identical copies into one (dst is otherwise
+		 * never read, so the whole loop is dead code with -O2/-O3). */
+		volatile BYTE sink = 0;
+
+		t0 = winpr_GetTickCount64NS();
+		for (int i = 0; i < BENCH_ITERATIONS; i++)
+		{
+			memcpy(rgbCopyDst, rgb, rgbSize);
+			sink ^= rgbCopyDst[0];
+		}
+		t1 = winpr_GetTickCount64NS();
+		bench_report("copy: one full-frame RGB memcpy", t0, t1, rgbSize);
+
+		t0 = winpr_GetTickCount64NS();
+		for (int i = 0; i < BENCH_ITERATIONS; i++)
+		{
+			memcpy(yuvCopyDst, yuv[0], yuvSize);
+			sink ^= yuvCopyDst[0];
+		}
+		t1 = winpr_GetTickCount64NS();
+		bench_report("copy: YUV420 plane memcpy (shm/dmabuf upload proxy)", t0, t1, yuvSize);
+		printf("    (sink=%u, ignore)\n", (unsigned)sink);
+	}
+
+	rc = TRUE;
+fail:
+	free_yuv(yuv);
+	free(rgb);
+	free(rgbCopyDst);
+	free(yuvCopyDst);
+	return rc;
+}
+
 int TestPrimitivesYUV(int argc, char* argv[])
 {
 	BOOL large = (argc > 1);
@@ -1440,7 +1535,7 @@ int TestPrimitivesYUV(int argc, char* argv[])
 			errno = 0;
 			roi.width = strtoul(str, nullptr, 0);
 			if (errno == 0)
-				roi.height = strtoul(str, nullptr, 0);
+				roi.height = strtoul(ptr, nullptr, 0);
 			reset = errno != 0;
 		}
 
@@ -1454,6 +1549,12 @@ int TestPrimitivesYUV(int argc, char* argv[])
 		get_size(large, &roi.width, &roi.height);
 
 	prim_test_setup(FALSE);
+
+	if ((argc > 2) && (strcmp(argv[2], "--bench") == 0))
+	{
+		rc = benchmark_yuv420_pipeline(roi) ? 0 : -1;
+		goto end;
+	}
 
 	for (UINT32 type = PRIMITIVES_PURE_SOFT; type <= PRIMITIVES_AUTODETECT; type++)
 	{

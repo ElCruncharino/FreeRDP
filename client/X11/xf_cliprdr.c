@@ -1484,6 +1484,10 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 	if (xevent->owner != xfc->drawable)
 		return FALSE;
 
+	WLog_INFO("xxxx-requestor", "requestor window=0x%08lx target=0x%08lx property=0x%08lx",
+	          (unsigned long)xevent->requestor, (unsigned long)xevent->target,
+	          (unsigned long)xevent->property);
+
 	delayRespond = FALSE;
 
 	if (!(respond = (XSelectionEvent*)calloc(1, sizeof(XSelectionEvent))))
